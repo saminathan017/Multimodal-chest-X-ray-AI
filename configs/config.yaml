@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────
+# configs/config.yaml
+# Central configuration for all pipeline components
+# ─────────────────────────────────────────────────────────────
+
+project:
+  name: "ClinicalAI-MultiModal-CDS"
+  version: "1.0.0"
+  description: "Multi-Modal Clinical Decision Support System"
+
+# ── AWS ──────────────────────────────────────────────────────
+aws:
+  region: "us-east-1"
+  s3_bucket: "clinical-ai-demo-bucket"          # replace with your bucket
+  s3_model_prefix: "models/"
+  s3_data_prefix: "data/"
+  sagemaker_role: "arn:aws:iam::ACCOUNT_ID:role/SageMakerExecutionRole"
+  ecr_repo: "clinical-ai-demo"
+  endpoint_name: "clinical-cds-endpoint"
+
+# ── Models ───────────────────────────────────────────────────
+models:
+  image:
+    name: "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    image_size: 224
+    num_classes: 14                              # CheXpert 14-label set
+    checkpoint_path: "models/image_model.pt"
+    device: "cuda"                               # auto-falls back to cpu
+
+  text:
+    name: "emilyalsentzer/Bio_ClinicalBERT"
+    max_length: 512
+    checkpoint_path: "models/text_model.pt"
+
+  fusion:
+    image_feat_dim: 512
+    text_feat_dim: 768
+    hidden_dim: 256
+    dropout: 0.3
+    checkpoint_path: "models/fusion_model.pt"
+
+# ── Labels (CheXpert 14) ──────────────────────────────────────
+labels:
+  - "No Finding"
+  - "Enlarged Cardiomediastinum"
+  - "Cardiomegaly"
+  - "Lung Opacity"
+  - "Lung Lesion"
+  - "Edema"
+  - "Consolidation"
+  - "Pneumonia"
+  - "Atelectasis"
+  - "Pneumothorax"
+  - "Pleural Effusion"
+  - "Pleural Other"
+  - "Fracture"
+  - "Support Devices"
+
+# ── Thresholds ───────────────────────────────────────────────
+inference:
+  confidence_threshold: 0.40
+  high_urgency_threshold: 0.75
+  gradcam_layer: "visual.trunk.blocks.11.norm1"
+
+# ── Report generation ────────────────────────────────────────
+report:
+  model: "gpt-3.5-turbo"                        # or bedrock claude
+  use_bedrock: true
+  bedrock_model_id: "anthropic.claude-3-haiku-20240307-v1:0"
+  max_tokens: 512
+
+# ── Streamlit app ────────────────────────────────────────────
+app:
+  title: "ClinicalAI — Multi-Modal CDS System"
+  subtitle: "AI-Powered Chest X-Ray + Clinical Notes Analysis"
+  port: 8501
+  max_upload_mb: 10

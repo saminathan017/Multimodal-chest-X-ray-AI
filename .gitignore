@@ -1,0 +1,70 @@
+# ── Secrets ───────────────────────────────────────────────────────
+.env
+*.pem
+*.key
+*.p12
+secrets.toml
+
+# ── Model weights (large binaries — store on S3/HuggingFace Hub) ──
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+model.tar.gz
+models/*
+!models/.gitkeep
+
+# ── Data ──────────────────────────────────────────────────────────
+data/raw/
+data/chexpert/
+data/mimic/
+*.dcm
+*.nii
+*.nii.gz
+
+# ── Python ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+
+# ── Virtual environments ──────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Jupyter ───────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── OS ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ── Streamlit ─────────────────────────────────────────────────────
+.streamlit/secrets.toml
+
+# ── IDE ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+
+# ── Logs / output ────────────────────────────────────────────────
+*.log
+logs/
+output/

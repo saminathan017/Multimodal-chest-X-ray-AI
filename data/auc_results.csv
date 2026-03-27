@@ -1,0 +1,15 @@
+label,auc,competition
+No Finding,0.8491541353383458,False
+Enlarged Cardiomediastinum,0.637467889908257,False
+Cardiomegaly,0.7629783841247343,True
+Lung Opacity,0.8732730746619636,False
+Lung Lesion,0.24463519313304716,False
+Edema,0.8855967078189301,True
+Consolidation,0.894316297301372,True
+Pneumonia,0.6244469026548672,False
+Atelectasis,0.7890827922077923,True
+Pneumothorax,0.820796460176991,False
+Pleural Effusion,0.8994101349539726,True
+Pleural Other,0.9613733905579398,False
+Fracture,,False
+Support Devices,0.7932886893811171,False
