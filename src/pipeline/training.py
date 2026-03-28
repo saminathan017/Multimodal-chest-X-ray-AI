@@ -31,11 +31,12 @@ import numpy as np
 from loguru import logger
 
 from src.models.image_encoder import ImageEncoder
-from src.models.text_encoder import TextEncoder
 from src.models.fusion_model import FusionModel
+from src.models import get_text_encoder
+from src.utils.mimic_cxr_dataset import MimicCXRDataset
 
 
-# ── CheXpert Dataset ─────────────────────────────────────────────────
+# ── CheXpert Dataset (image-only labels, synthetic notes) ────────────
 class CheXpertDataset(Dataset):
     """
     Loads CheXpert CSV + image files.
@@ -104,7 +105,12 @@ class MultiModalTrainer:
         self.image_encoder = ImageEncoder.from_pretrained(
             num_classes=14, device=self.device, freeze_backbone=True
         )
-        self.text_encoder  = TextEncoder.from_pretrained(device=self.device, freeze_backbone=True)
+        self.text_encoder  = get_text_encoder(
+            encoder_type    = args.encoder,
+            output_dim      = 512,
+            device          = self.device,
+            freeze_backbone = True,
+        )
         self.fusion_model  = FusionModel(feat_dim=512, hidden_dim=256, num_classes=14).to(self.device)
 
         # Optimizer: only train fusion + classification heads
@@ -201,13 +207,17 @@ class MultiModalTrainer:
 # ── Entry point ──────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir",       default="data/chexpert")
-    parser.add_argument("--output_dir",     default="models/")
-    parser.add_argument("--epochs",         type=int,   default=10)
-    parser.add_argument("--batch_size",     type=int,   default=32)
-    parser.add_argument("--lr",             type=float, default=1e-4)
-    parser.add_argument("--steps_per_epoch",type=int,   default=500)
-    parser.add_argument("--dry_run",        action="store_true")
+    parser.add_argument("--data_dir",        default="data/chexpert",
+                        help="CheXpert root dir (or use --mimic_dir for MIMIC-CXR)")
+    parser.add_argument("--mimic_dir",       default=None,
+                        help="MIMIC-CXR root dir — uses real radiology reports when set")
+    parser.add_argument("--output_dir",      default="models/")
+    parser.add_argument("--encoder",         default="bart", choices=["bart", "bert"])
+    parser.add_argument("--epochs",          type=int,   default=10)
+    parser.add_argument("--batch_size",      type=int,   default=32)
+    parser.add_argument("--lr",              type=float, default=1e-4)
+    parser.add_argument("--steps_per_epoch", type=int,   default=500)
+    parser.add_argument("--dry_run",         action="store_true")
     args = parser.parse_args()
 
     if args.dry_run:
@@ -216,11 +226,21 @@ def main():
 
     trainer = MultiModalTrainer(args)
 
-    train_csv = f"{args.data_dir}/train.csv"
-    val_csv   = f"{args.data_dir}/valid.csv"
-
-    train_ds = CheXpertDataset(train_csv, args.data_dir, "train")
-    val_ds   = CheXpertDataset(val_csv,   args.data_dir, "val")
+    # ── Dataset: prefer MIMIC-CXR (real reports) over CheXpert ──────
+    if args.mimic_dir:
+        logger.info(f"Using MIMIC-CXR with real radiology reports: {args.mimic_dir}")
+        train_ds = MimicCXRDataset(args.mimic_dir, split="train",    augment=True)
+        val_ds   = MimicCXRDataset(args.mimic_dir, split="validate", augment=False)
+    else:
+        logger.warning(
+            "Using CheXpert with SYNTHETIC notes ('Chest radiograph. PA view.'). "
+            "Text encoder will not learn from real clinical language. "
+            "Pass --mimic_dir to use real MIMIC-CXR reports."
+        )
+        train_csv = f"{args.data_dir}/train.csv"
+        val_csv   = f"{args.data_dir}/valid.csv"
+        train_ds = CheXpertDataset(train_csv, args.data_dir, "train")
+        val_ds   = CheXpertDataset(val_csv,   args.data_dir, "val")
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=4, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
