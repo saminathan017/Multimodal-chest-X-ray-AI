@@ -24,8 +24,8 @@ from PIL import Image
 from loguru import logger
 
 from src.models.image_encoder import ImageEncoder, XRayExplainer
-from src.models.text_encoder import TextEncoder
 from src.models.fusion_model import FusionModel
+from src.models import get_text_encoder
 
 
 # ── Output schema ────────────────────────────────────────────────────
@@ -91,11 +91,14 @@ class ClinicalAIPipeline:
             device=self.device,
         )
 
-        self.text_encoder = TextEncoder.from_pretrained(
-            checkpoint_path=model_cfg.get("text", {}).get("checkpoint_path"),
-            output_dim=512,
-            device=self.device,
+        text_cfg          = model_cfg.get("text", {})
+        self.text_encoder = get_text_encoder(
+            encoder_type    = text_cfg.get("encoder_type", "bert"),
+            checkpoint_path = text_cfg.get("checkpoint_path"),
+            output_dim      = 512,
+            device          = self.device,
         )
+        logger.info(f"Text encoder: {self.text_encoder}")
 
         self.fusion_model = FusionModel.from_pretrained(
             checkpoint_path=model_cfg.get("fusion", {}).get("checkpoint_path"),

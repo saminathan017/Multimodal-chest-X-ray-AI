@@ -28,8 +28,10 @@ models:
     device: "cuda"                               # auto-falls back to cpu
 
   text:
-    name: "emilyalsentzer/Bio_ClinicalBERT"
-    max_length: 512
+    encoder_type: "bart"                              # "bart" | "bert"
+    name: "GanjinZero/biobart-v2-base"                # BioBART (PubMed + PMC)
+    # name: "emilyalsentzer/Bio_ClinicalBERT"         # switch to BERT: change encoder_type to "bert"
+    max_length: 1024                                  # BART supports 1024 (BERT max: 512)
     checkpoint_path: "models/text_model.pt"
 
   fusion:
