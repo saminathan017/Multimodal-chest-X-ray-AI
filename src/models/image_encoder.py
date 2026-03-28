@@ -65,17 +65,7 @@ class ImageEncoder(nn.Module):
             self.backbone, _, self.preprocess = open_clip.create_model_and_transforms(
                 self.BIOMEDCLIP_MODEL
             )
-            # Detect output dim robustly across open_clip versions
-            try:
-                feat_dim = self.backbone.visual.output_dim
-            except AttributeError:
-                try:
-                    feat_dim = self.backbone.visual.head.in_features
-                except AttributeError:
-                    # Run a dummy forward pass to get the actual dim
-                    with torch.no_grad():
-                        _dummy = torch.zeros(1, 3, 224, 224)
-                        feat_dim = self.backbone.encode_image(_dummy).shape[-1]
+            feat_dim = 512  # BiomedCLIP ViT-B/16 always outputs 512-d
         else:
             # Mock backbone for CI / environments without GPU
             self.backbone = None
