@@ -239,6 +239,14 @@ def main():
         )
         train_csv = f"{args.data_dir}/train.csv"
         val_csv   = f"{args.data_dir}/valid.csv"
+        if not Path(val_csv).exists():
+            logger.warning("valid.csv not found — splitting train.csv 90/10 for validation")
+            full_df = pd.read_csv(train_csv)
+            split_idx = int(len(full_df) * 0.9)
+            full_df.iloc[:split_idx].to_csv("/tmp/chexpert_train_split.csv", index=False)
+            full_df.iloc[split_idx:].to_csv("/tmp/chexpert_val_split.csv", index=False)
+            train_csv = "/tmp/chexpert_train_split.csv"
+            val_csv   = "/tmp/chexpert_val_split.csv"
         train_ds = CheXpertDataset(train_csv, args.data_dir, "train")
         val_ds   = CheXpertDataset(val_csv,   args.data_dir, "val")
 
