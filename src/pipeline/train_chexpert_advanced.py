@@ -141,9 +141,30 @@ class CheXpertImageDataset(Dataset):
     def __len__(self) -> int:
         return len(self.df)
 
+    def _image_path(self, raw_path: str) -> Path:
+        path = self.data_dir / raw_path
+        if path.exists():
+            return path
+
+        # Kaggle CheXpert small often stores CSV paths as
+        # CheXpert-v1.0-small/train/... while users point data_dir directly at
+        # that CheXpert-v1.0-small directory. Strip the duplicated root.
+        parts = Path(raw_path).parts
+        if parts and parts[0] == self.data_dir.name:
+            stripped = self.data_dir.joinpath(*parts[1:])
+            if stripped.exists():
+                return stripped
+
+        # Also support pointing data_dir at the parent folder, data/chexpert.
+        nested = self.data_dir / self.data_dir.name / raw_path
+        if nested.exists():
+            return nested
+
+        return path
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         row = self.df.iloc[index]
-        path = self.data_dir / str(row["Path"])
+        path = self._image_path(str(row["Path"]))
         try:
             image = Image.open(path).convert("RGB")
             image_tensor = self.transform(image)
