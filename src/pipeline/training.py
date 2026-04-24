@@ -224,8 +224,6 @@ def main():
         logger.info("Dry run — skipping actual training")
         return
 
-    trainer = MultiModalTrainer(args)
-
     # ── Dataset: prefer MIMIC-CXR (real reports) over CheXpert ──────
     if args.mimic_dir:
         logger.info(f"Using MIMIC-CXR with real radiology reports: {args.mimic_dir}")
@@ -252,6 +250,9 @@ def main():
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=4, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
+    args.steps_per_epoch = len(train_loader)
+    trainer = MultiModalTrainer(args)
 
     best_auc = 0.0
     for epoch in range(1, args.epochs + 1):
