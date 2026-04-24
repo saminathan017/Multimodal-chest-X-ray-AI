@@ -15,9 +15,18 @@ import torch.nn as nn
 import numpy as np
 from PIL import Image
 from loguru import logger
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.image import show_cam_on_image
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+
+try:
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.image import show_cam_on_image
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    GRADCAM_AVAILABLE = True
+except ImportError:
+    GradCAM = None
+    show_cam_on_image = None
+    ClassifierOutputTarget = None
+    GRADCAM_AVAILABLE = False
+    logger.warning("pytorch-grad-cam not available – heatmaps will be skipped")
 
 try:
     import open_clip
@@ -148,7 +157,7 @@ class XRayExplainer:
         self.device = device
 
         # Target the last transformer block's norm layer inside the ViT
-        if model.backbone is not None and hasattr(model.backbone, "visual"):
+        if GRADCAM_AVAILABLE and model.backbone is not None and hasattr(model.backbone, "visual"):
             try:
                 target_layers = [model.backbone.visual.trunk.blocks[-1].norm1]
                 self.cam = GradCAM(

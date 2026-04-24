@@ -20,6 +20,10 @@ models/*
 data/raw/
 data/chexpert/
 data/mimic/
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/dataset_registry.json
 *.dcm
 *.nii
 *.nii.gz

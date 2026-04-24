@@ -20,6 +20,12 @@ aws:
 
 # ── Models ───────────────────────────────────────────────────
 models:
+  foundation:
+    cxr_foundation: "google/cxr-foundation"
+    biomedclip: "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
+    cxr_bert: "microsoft/BiomedVLP-CXR-BERT-specialized"
+    cache_dir: "models/hf"
+
   image:
     name: "microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224"
     image_size: 224

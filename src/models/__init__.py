@@ -1,7 +1,6 @@
-from .image_encoder      import ImageEncoder, XRayExplainer
-from .text_encoder       import TextEncoder
-from .bart_text_encoder  import BartClinicalEncoder
-from .fusion_model       import FusionModel
+"""Model package exports with lazy heavyweight imports."""
+
+from __future__ import annotations
 
 
 def get_text_encoder(
@@ -20,17 +19,59 @@ def get_text_encoder(
         enc = get_text_encoder("bart", output_dim=512, device="cuda")
         enc = get_text_encoder("bert", output_dim=512, device="cpu")
     """
-    encoders = {
-        "bart": BartClinicalEncoder,
-        "bert": TextEncoder,
-    }
     key = encoder_type.lower().strip()
-    if key not in encoders:
+    if key == "bart":
+        from .bart_text_encoder import BartClinicalEncoder
+
+        return BartClinicalEncoder.from_pretrained(**kwargs)
+    if key == "bert":
+        from .text_encoder import TextEncoder
+
+        return TextEncoder.from_pretrained(**kwargs)
+    if key not in {"bart", "bert"}:
         raise ValueError(
             f"Unknown encoder_type '{encoder_type}'. "
-            f"Choose from: {list(encoders.keys())}"
+            "Choose from: ['bart', 'bert']"
         )
-    return encoders[key].from_pretrained(**kwargs)
+
+
+def __getattr__(name: str):
+    if name in {"ImageEncoder", "XRayExplainer"}:
+        from .image_encoder import ImageEncoder, XRayExplainer
+
+        return {"ImageEncoder": ImageEncoder, "XRayExplainer": XRayExplainer}[name]
+    if name == "TextEncoder":
+        from .text_encoder import TextEncoder
+
+        return TextEncoder
+    if name == "BartClinicalEncoder":
+        from .bart_text_encoder import BartClinicalEncoder
+
+        return BartClinicalEncoder
+    if name == "FusionModel":
+        from .fusion_model import FusionModel
+
+        return FusionModel
+    if name in {"FoundationModelV2Spec", "MultiTaskHeadSpec"}:
+        from .foundation_v2 import FoundationModelV2Spec, MultiTaskHeadSpec
+
+        return {
+            "FoundationModelV2Spec": FoundationModelV2Spec,
+            "MultiTaskHeadSpec": MultiTaskHeadSpec,
+        }[name]
+    if name in {"BiomedCLIPExtractor", "CXRBertExtractor", "GoogleCXRFoundationExtractor"}:
+        from .foundation_extractors import (
+            BiomedCLIPExtractor,
+            CXRBertExtractor,
+            GoogleCXRFoundationExtractor,
+        )
+
+        return {
+            "BiomedCLIPExtractor": BiomedCLIPExtractor,
+            "CXRBertExtractor": CXRBertExtractor,
+            "GoogleCXRFoundationExtractor": GoogleCXRFoundationExtractor,
+        }[name]
+    raise AttributeError(name)
 
 
 __all__ = [
@@ -39,5 +80,10 @@ __all__ = [
     "TextEncoder",
     "BartClinicalEncoder",
     "FusionModel",
+    "FoundationModelV2Spec",
+    "MultiTaskHeadSpec",
+    "BiomedCLIPExtractor",
+    "CXRBertExtractor",
+    "GoogleCXRFoundationExtractor",
     "get_text_encoder",
 ]

@@ -33,14 +33,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
-import json
 import time
 import uuid
-from datetime import datetime, timedelta
-from functools import wraps
-from typing import Optional, Annotated
+from datetime import datetime, UTC
+from typing import Optional
 
-import boto3
 from fastapi import FastAPI, HTTPException, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -48,7 +45,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from loguru import logger
 from PIL import Image
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 # Local imports
 from src.safety.phi_detector   import PHIDetector
@@ -56,6 +53,14 @@ from src.safety.input_validator import InputValidator
 from src.safety.fairness_monitor import FairnessMonitor
 from src.api.audit              import AuditLogger
 from src.api.auth               import JWTHandler, UserRole, decode_token
+from src.api.case_store         import CaseStore
+from src.integration.fhir_pacs  import FHIRImport, PACSImport, build_diagnostic_report_resource
+from src.monitoring.case_analytics import CaseAnalytics
+from src.evaluation.active_learning import build_active_learning_queue
+from src.evaluation.datasets import DatasetRegistry, default_dataset_specs
+from src.evaluation.model_card import build_model_card
+from src.evaluation.model_registry import ModelRegistry
+from src.models.foundation_v2 import FoundationModelV2Spec
 
 
 # ── App setup ────────────────────────────────────────────────────────
@@ -72,7 +77,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://clinical-ai.yourdomain.com"],   # production domain only
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Authorization", "Content-Type"],
 )
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])  # set specific hosts in prod
@@ -84,6 +89,13 @@ fairness_monitor = FairnessMonitor()
 audit_logger    = AuditLogger()
 jwt_handler     = JWTHandler()
 security        = HTTPBearer()
+case_store      = CaseStore()
+case_analytics  = CaseAnalytics(case_store)
+dataset_registry = DatasetRegistry()
+for _spec in default_dataset_specs():
+    if _spec.name not in {item["name"] for item in dataset_registry.list()}:
+        dataset_registry.register(_spec)
+model_registry = ModelRegistry()
 
 # Pipeline loaded lazily to avoid import-time model loading
 _pipeline       = None
@@ -154,7 +166,8 @@ class AnalyzeRequest(BaseModel):
     )
     request_id:    Optional[str] = Field(default=None, description="Client-supplied idempotency key")
 
-    @validator("image_b64")
+    @field_validator("image_b64")
+    @classmethod
     def check_image_size(cls, v):
         # ~15MB base64 limit (≈10MB raw image)
         if len(v) > 15_000_000:
@@ -170,6 +183,7 @@ class FindingResponse(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
+    case_id:            str
     request_id:         str
     findings:           list[FindingResponse]
     urgency_score:      float
@@ -189,6 +203,34 @@ class FeedbackRequest(BaseModel):
     radiologist_findings: list[str]
     comments:       Optional[str]
     corrected:      bool
+    decision:        str = Field(default="edited", description="accepted | edited | rejected | escalated")
+
+
+class CaseStatusUpdate(BaseModel):
+    status: str = Field(..., description="new | in_review | accepted | edited | rejected | escalated")
+    assigned_to: Optional[str] = None
+
+
+class IntegrationAttachRequest(BaseModel):
+    source: str = Field(..., description="FHIR or PACS")
+    patient_id: Optional[str] = None
+    encounter_id: Optional[str] = None
+    imaging_study_id: Optional[str] = None
+    study_instance_uid: Optional[str] = None
+    series_instance_uid: Optional[str] = None
+    sop_instance_uid: Optional[str] = None
+    accession_number: Optional[str] = None
+    modality: str = "CR"
+    body_site: str = "Chest"
+    study_description: str = "Chest radiograph"
+    aetitle: Optional[str] = None
+
+
+class ReportVersionRequest(BaseModel):
+    report_text: str = Field(..., min_length=20, max_length=8000)
+    structured_findings: list[dict] = Field(default_factory=list)
+    change_summary: Optional[str] = None
+    source: str = "clinician_edit"
 
 
 # ── Health check ─────────────────────────────────────────────────────
@@ -196,7 +238,7 @@ class FeedbackRequest(BaseModel):
 async def health_check():
     return {
         "status":    "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "version":   "1.0.0",
         "services": {
             "phi_detector":    "online",
@@ -331,7 +373,28 @@ async def analyze(
         if result.uncertainty else {}
     )
 
+    case = case_store.create_case(
+        request_id=request_id,
+        priority=getattr(result, "workflow", {}).get("priority", result.urgency_label),
+        urgency_score=round(result.urgency_score, 4),
+        top_finding=result.top_finding,
+        patient_context=request.patient_context or {},
+        findings=[
+            {
+                "label": f["label"],
+                "prob": round(f["prob"], 4),
+                "urgent": f["urgent"],
+            }
+            for f in result.findings
+        ],
+        workflow=getattr(result, "workflow", {}),
+        uncertainty=uncertainty_dict,
+        clinical_report=result.clinical_report,
+        safety_flags=safety_flags,
+    )
+
     return AnalyzeResponse(
+        case_id=case.case_id,
         request_id=request_id,
         findings=findings_response,
         urgency_score=round(result.urgency_score, 4),
@@ -350,10 +413,176 @@ async def analyze(
     )
 
 
+# ── Clinical worklist ─────────────────────────────────────────────────
+@app.get("/api/v1/cases", tags=["Workflow"])
+async def list_cases(
+    status_filter: Optional[str] = None,
+    priority: Optional[str] = None,
+    limit: int = 50,
+    user: dict = Depends(require_auth),
+):
+    limit = max(1, min(limit, 200))
+    return {
+        "cases": [
+            case.to_dict()
+            for case in case_store.list_cases(
+                status=status_filter,
+                priority=priority,
+                limit=limit,
+            )
+        ]
+    }
+
+
+@app.get("/api/v1/cases/{case_id}", tags=["Workflow"])
+async def get_case(case_id: str, user: dict = Depends(require_auth)):
+    try:
+        return case_store.get_case(case_id).to_dict()
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+
+
+@app.patch("/api/v1/cases/{case_id}", tags=["Workflow"])
+async def update_case_status(
+    case_id: str,
+    update: CaseStatusUpdate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        return case_store.update_status(
+            case_id,
+            status=update.status,
+            assigned_to=update.assigned_to or user.get("sub"),
+        ).to_dict()
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+
+
+@app.post("/api/v1/cases/{case_id}/integration", tags=["Integration"])
+async def attach_integration(
+    case_id: str,
+    payload: IntegrationAttachRequest,
+    user: dict = Depends(require_auth),
+):
+    source = payload.source.upper()
+    try:
+        if source == "FHIR":
+            if not payload.patient_id:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="patient_id is required for FHIR")
+            metadata = FHIRImport(
+                patient_id=payload.patient_id,
+                encounter_id=payload.encounter_id,
+                imaging_study_id=payload.imaging_study_id,
+                accession_number=payload.accession_number,
+                modality=payload.modality,
+                body_site=payload.body_site,
+                study_description=payload.study_description,
+            ).to_integration_metadata()
+        elif source == "PACS":
+            if not payload.study_instance_uid:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="study_instance_uid is required for PACS")
+            metadata = PACSImport(
+                study_instance_uid=payload.study_instance_uid,
+                series_instance_uid=payload.series_instance_uid,
+                sop_instance_uid=payload.sop_instance_uid,
+                accession_number=payload.accession_number,
+                aetitle=payload.aetitle,
+                modality=payload.modality,
+            ).to_integration_metadata()
+        else:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="source must be FHIR or PACS")
+        return case_store.update_integration(case_id, integration=metadata).to_dict()
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+
+
+@app.post("/api/v1/cases/{case_id}/report_versions", tags=["Reporting"])
+async def create_report_version(
+    case_id: str,
+    payload: ReportVersionRequest,
+    user: dict = Depends(require_auth),
+):
+    try:
+        structured = payload.structured_findings or case_store.get_case(case_id).structured_findings
+        return case_store.add_report_version(
+            case_id=case_id,
+            author_id_hash=hashlib.sha256(user["sub"].encode()).hexdigest()[:12],
+            source=payload.source,
+            report_text=payload.report_text,
+            structured_findings=structured,
+            change_summary=payload.change_summary,
+        )
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+
+
+@app.get("/api/v1/cases/{case_id}/report_versions", tags=["Reporting"])
+async def list_report_versions(case_id: str, user: dict = Depends(require_auth)):
+    try:
+        case_store.get_case(case_id)
+        return {"versions": case_store.list_report_versions(case_id)}
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+
+
+@app.get("/api/v1/cases/{case_id}/fhir/diagnostic-report", tags=["Integration"])
+async def export_fhir_diagnostic_report(case_id: str, user: dict = Depends(require_auth)):
+    try:
+        case = case_store.get_case(case_id)
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+    return build_diagnostic_report_resource(
+        case_id=case.case_id,
+        report_text=case.clinical_report,
+        structured_findings=case.structured_findings,
+        integration=case.integration,
+    )
+
+
 # ── Fairness report ───────────────────────────────────────────────────
 @app.get("/api/v1/fairness/report", tags=["Monitoring"])
 async def fairness_report(user: dict = Depends(require_auth)):
     return fairness_monitor.get_fairness_report()
+
+
+@app.get("/api/v1/analytics/dashboard", tags=["Monitoring"])
+async def analytics_dashboard(
+    limit: int = 1000,
+    user: dict = Depends(require_auth),
+):
+    limit = max(1, min(limit, 5000))
+    return CaseAnalytics(case_store).dashboard(limit=limit)
+
+
+@app.get("/api/v1/validation/dashboard", tags=["Validation"])
+async def validation_dashboard(user: dict = Depends(require_auth)):
+    analytics = CaseAnalytics(case_store).dashboard(limit=1000)
+    latest_model = model_registry.latest()
+    datasets = dataset_registry.list()
+    foundation_spec = FoundationModelV2Spec().to_dict()
+    active_learning = build_active_learning_queue(case_store, limit=25)
+    card = build_model_card(
+        model_version=latest_model.model_version if latest_model else "clinical-ai-v1.0.0",
+        datasets=datasets,
+        metrics=latest_model.metrics if latest_model else {"note": "No registered validation run yet."},
+        calibration=latest_model.calibration if latest_model else {"note": "Calibration pending external validation."},
+        thresholds=latest_model.thresholds if latest_model else {"note": "Thresholds pending optimization."},
+    )
+    return {
+        "analytics": analytics,
+        "datasets": datasets,
+        "latest_model": latest_model.__dict__ if latest_model else None,
+        "active_learning_queue": active_learning,
+        "foundation_model_v2": foundation_spec,
+        "model_card": card,
+    }
+
+
+@app.get("/api/v1/validation/active-learning", tags=["Validation"])
+async def active_learning_queue(limit: int = 50, user: dict = Depends(require_auth)):
+    return {"queue": build_active_learning_queue(case_store, limit=max(1, min(limit, 200)))}
 
 
 # ── Model info ────────────────────────────────────────────────────────
@@ -397,8 +626,23 @@ async def submit_feedback(
         corrected=feedback.corrected,
         finding_count=len(feedback.radiologist_findings),
     )
+    try:
+        feedback_entry = case_store.add_feedback(
+            request_id=feedback.request_id,
+            user_id_hash=hashlib.sha256(user["sub"].encode()).hexdigest()[:12],
+            decision=feedback.decision,
+            corrected=feedback.corrected,
+            radiologist_findings=feedback.radiologist_findings,
+            comments=feedback.comments,
+        )
+    except KeyError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Case not found")
+    try:
+        case_store.update_status(feedback_entry["case_id"], status=feedback.decision, assigned_to=user["sub"])
+    except ValueError:
+        case_store.update_status(feedback_entry["case_id"], status="edited", assigned_to=user["sub"])
     logger.info(f"Feedback received for {feedback.request_id} — corrected={feedback.corrected}")
-    return {"status": "feedback_received", "request_id": feedback.request_id}
+    return {"status": "feedback_received", "request_id": feedback.request_id, "feedback": feedback_entry}
 
 
 # ── Audit log (admin only) ────────────────────────────────────────────

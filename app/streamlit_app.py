@@ -3,9 +3,16 @@ ClinicalAI — Multi-Modal Clinical Decision Support System
 """
 import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-import io, yaml, numpy as np, streamlit as st
+import io, uuid, yaml, numpy as np, streamlit as st
 from pathlib import Path
 from PIL import Image
+from src.clinical_workflow import compute_workflow_summary
+from src.api.case_store import CaseStore
+from src.integration.fhir_pacs import FHIRImport, PACSImport, build_diagnostic_report_resource
+from src.monitoring.case_analytics import CaseAnalytics
+from src.evaluation.active_learning import build_active_learning_queue
+from src.evaluation.datasets import default_dataset_specs
+from src.models.foundation_v2 import FoundationModelV2Spec
 
 AUC_DATA = {
     "No Finding":                 {"auc": 0.8492, "competition": False},
@@ -620,6 +627,53 @@ div[data-testid="stProgress"] > div > div {
 }
 .path-pill:hover { border-color:rgba(37,99,235,.35); color:var(--blue); background:var(--blue3); transform:translateY(-1px); }
 .path-pill.comp { border-color:rgba(37,99,235,.28); color:var(--blue); background:var(--blue3); }
+
+/* Clinician workflow */
+.workflow-grid { display:grid; grid-template-columns:1.1fr 1fr 1fr; gap:14px; margin-bottom:24px; }
+.workflow-card {
+  background:white; border:1px solid var(--ink6); border-radius:14px;
+  padding:18px 20px; box-shadow:0 1px 4px rgba(8,15,30,.06);
+}
+.workflow-label { font-size:.56rem; font-weight:800; letter-spacing:2px; text-transform:uppercase; color:var(--ink4); margin-bottom:10px; }
+.workflow-title { font-size:1.02rem; font-weight:800; color:var(--ink); letter-spacing:-.2px; margin-bottom:5px; }
+.workflow-copy { font-size:.76rem; color:var(--ink3); line-height:1.65; }
+.action-list { margin:0; padding-left:16px; }
+.action-list li { font-size:.76rem; color:var(--ink3); line-height:1.75; margin:2px 0; }
+.evidence-row { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+.evidence-chip {
+  border:1px solid var(--ink6); background:#fafbfd; border-radius:7px;
+  padding:5px 9px; font-size:.68rem; color:var(--ink3); font-weight:600;
+}
+.worklist-item {
+  border:1px solid var(--ink6); border-radius:10px; padding:12px 14px;
+  margin:8px 0; background:#fff; box-shadow:0 1px 3px rgba(8,15,30,.05);
+}
+.worklist-top { display:flex; justify-content:space-between; align-items:center; gap:10px; }
+.worklist-finding { font-size:.82rem; font-weight:800; color:var(--ink); }
+.worklist-meta { margin-top:5px; font-size:.68rem; color:var(--ink4); line-height:1.5; }
+.tool-band {
+  border:1px solid var(--ink6); border-radius:14px; background:#fafbfd;
+  padding:16px; margin:18px 0 8px;
+}
+.version-row {
+  border-left:3px solid var(--blue); background:white; border-radius:8px;
+  padding:10px 12px; margin:7px 0; border-top:1px solid var(--ink6);
+  border-right:1px solid var(--ink6); border-bottom:1px solid var(--ink6);
+}
+.version-title { font-size:.74rem; font-weight:800; color:var(--ink2); }
+.version-meta { font-size:.64rem; color:var(--ink4); margin-top:4px; }
+.analytics-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:10px 0 18px; }
+.analytics-card {
+  background:#fff; border:1px solid var(--ink6); border-radius:12px;
+  padding:15px 16px; box-shadow:0 1px 3px rgba(8,15,30,.05);
+}
+.analytics-value { font-size:1.35rem; font-weight:850; color:var(--ink); letter-spacing:-.5px; }
+.analytics-label { font-size:.55rem; font-weight:800; letter-spacing:1.7px; text-transform:uppercase; color:var(--ink4); margin-top:6px; }
+.alert-row {
+  border:1px solid rgba(217,119,6,.22); background:var(--amber2);
+  color:#78350f; border-radius:9px; padding:9px 12px; font-size:.74rem;
+  margin:6px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -637,6 +691,10 @@ def load_pipeline(config):
         return ClinicalAIPipeline(config), None
     except Exception as e:
         return None, str(e)
+
+@st.cache_resource
+def load_case_store():
+    return CaseStore()
 
 
 # ── Mock inference ────────────────────────────────────────────────────────────
@@ -675,6 +733,12 @@ RECOMMENDATION
 DISCLAIMER  AI-generated for research/demonstration only.
 Must be verified by a licensed radiologist before any
 clinical decision-making. Not for diagnostic use."""
+    workflow = compute_workflow_summary(
+        note=note,
+        findings=findings,
+        urgency_score=urgency,
+        uncertainty_flag=urgency > 0.68 and findings[0]["prob"] < 0.80,
+    )
     return {
         "findings":findings,"urgency_score":urgency,"clinical_report":report,
         "inference_time_ms":1247.3,
@@ -684,6 +748,11 @@ clinical decision-making. Not for diagnostic use."""
             "symptoms":[k for k in ["cough","fever","dyspnea","chest pain","shortness of breath"] if k in nl],
         },
         "heatmap":None,
+        "workflow": workflow.__dict__,
+        "uncertainty": {
+            "uncertainty_flag": workflow.human_review_required and urgency < 0.75,
+            "prediction_set_95pct": [f["label"] for f in findings[:3]],
+        },
     }
 
 
@@ -720,7 +789,10 @@ def render_sidebar(config):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     config = load_config()
+    case_store = load_case_store()
     threshold, show_heatmap, demo_mode = render_sidebar(config)
+    _render_analytics_dashboard(case_store)
+    _render_validation_science_dashboard(case_store)
 
     # ════════════════════════════════════════
     #  HERO
@@ -821,8 +893,11 @@ def main():
                              (90,"GradCAM + uncertainty quantification..."),(100,"Complete")]:
                 prog.progress(pct, msg); time.sleep(.28 if demo_mode else .07)
             result = mock_predict(image, clinical_note) if demo_mode else _live_predict(image, clinical_note, config)
+            if "request_id" not in result:
+                result["request_id"] = f"demo-{uuid.uuid4().hex[:10]}"
         st.session_state["result"] = result
         st.session_state["img"]    = image
+        st.session_state["note"]   = clinical_note
         st.session_state.pop("_running", None)
         st.rerun()
     else:
@@ -839,6 +914,7 @@ def main():
 
     result   = st.session_state["result"]
     img      = st.session_state.get("img")
+    clinical_note = st.session_state.get("note", clinical_note)
     urgency  = result["urgency_score"]
     findings = result["findings"]
     flagged  = [f for f in findings if f["prob"] >= threshold]
@@ -851,6 +927,58 @@ def main():
 
     st.markdown("<div class='div'></div>", unsafe_allow_html=True)
     st.markdown("<div class='st'>Analysis Results</div>", unsafe_allow_html=True)
+
+    workflow = result.get("workflow") or compute_workflow_summary(
+        note=clinical_note,
+        findings=findings,
+        urgency_score=urgency,
+        uncertainty_flag=bool(result.get("uncertainty", {}).get("uncertainty_flag", False)),
+    ).__dict__
+    evidence_html = "".join(
+        f"<span class='evidence-chip'>{item}</span>" for item in workflow.get("evidence", [])[:6]
+    ) or "<span class='evidence-chip'>Evidence pending clinician review</span>"
+    actions_html = "".join(
+        f"<li>{action}</li>" for action in workflow.get("suggested_actions", [])[:5]
+    )
+
+    st.markdown(f"""
+    <div class='workflow-grid'>
+      <div class='workflow-card'>
+        <div class='workflow-label'>Case Priority</div>
+        <div class='workflow-title'>{workflow.get("priority", "Review")}</div>
+        <div class='workflow-copy'>{workflow.get("priority_reason", "Clinician review required.")}</div>
+      </div>
+      <div class='workflow-card'>
+        <div class='workflow-label'>Evidence</div>
+        <div class='evidence-row'>{evidence_html}</div>
+      </div>
+      <div class='workflow-card'>
+        <div class='workflow-label'>Next Actions</div>
+        <ul class='action-list'>{actions_html}</ul>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if "case_id" not in result:
+        case = case_store.create_case(
+            request_id=result.get("request_id", f"demo-{uuid.uuid4().hex[:10]}"),
+            priority=workflow.get("priority", "Review"),
+            urgency_score=float(urgency),
+            top_finding=top["label"],
+            patient_context=result.get("clinical_entities", {}),
+            findings=[
+                {"label": f["label"], "prob": float(f["prob"]), "urgent": bool(f.get("urgent", False))}
+                for f in findings
+            ],
+            workflow=workflow,
+            uncertainty=result.get("uncertainty", {}),
+            clinical_report=result["clinical_report"],
+            safety_flags=["DEMO_MODE"] if demo_mode else [],
+        )
+        result["case_id"] = case.case_id
+        st.session_state["result"] = result
+
+    _render_case_tools(case_store, result)
 
     # KPI row
     k1, k2, k3, k4 = st.columns(4)
@@ -982,9 +1110,243 @@ def _live_predict(image, note, config):
     if error:
         st.error(f"Model loading failed: {error}"); st.stop()
     pred = pipeline.predict(image, note)
-    return {"findings":pred.findings,"urgency_score":pred.urgency_score,
+    return {"request_id": getattr(pred, "request_id", f"live-{uuid.uuid4().hex[:10]}"),
+            "findings":pred.findings,"urgency_score":pred.urgency_score,
             "clinical_report":pred.clinical_report,"inference_time_ms":pred.inference_time_ms,
-            "clinical_entities":pred.clinical_entities,"heatmap":pred.heatmap}
+            "clinical_entities":pred.clinical_entities,"heatmap":pred.heatmap,
+            "workflow":getattr(pred, "workflow", {}),
+            "uncertainty":getattr(pred.uncertainty, "summary", lambda labels: {})(getattr(pred, "LABELS", [])) if getattr(pred, "uncertainty", None) else {}}
+
+
+def _render_case_tools(case_store, result):
+    case_id = result.get("case_id")
+    if not case_id:
+        return
+    case = case_store.get_case(case_id)
+
+    st.markdown("<div class='tool-band'>", unsafe_allow_html=True)
+    st.markdown("<div class='st'>Clinical Worklist Tools</div>", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    status_actions = [
+        (c1, "Start Review", "in_review"),
+        (c2, "Accept Draft", "accepted"),
+        (c3, "Escalate", "escalated"),
+        (c4, "Reject AI", "rejected"),
+    ]
+    for col, label, status_value in status_actions:
+        with col:
+            if st.button(label, use_container_width=True):
+                case_store.update_status(case_id, status=status_value, assigned_to="demo-clinician")
+                st.toast(f"Case marked {status_value.replace('_', ' ')}")
+
+    with st.expander("Radiologist feedback", expanded=False):
+        decision = st.selectbox("Decision", ["accepted", "edited", "rejected", "escalated"], index=1)
+        corrected = st.checkbox("AI output required correction", value=decision in {"edited", "rejected"})
+        findings_text = st.text_input("Confirmed findings", value=result["findings"][0]["label"] if result.get("findings") else "")
+        comments = st.text_area("Review note", height=80, placeholder="Brief reviewer note, no direct identifiers.")
+        if st.button("Save Feedback", use_container_width=True):
+            case_store.add_feedback(
+                request_id=result["request_id"],
+                user_id_hash="demo-clinician",
+                decision=decision,
+                corrected=corrected,
+                radiologist_findings=[f.strip() for f in findings_text.split(",") if f.strip()],
+                comments=comments or None,
+            )
+            case_store.update_status(case_id, status=decision, assigned_to="demo-clinician")
+            st.toast("Feedback saved")
+
+    with st.expander("Structured report editor", expanded=False):
+        edited_report = st.text_area(
+            "Report draft",
+            value=case.clinical_report,
+            height=220,
+            key=f"report_editor_{case_id}",
+        )
+        structured_rows = case.structured_findings or [
+            {
+                "label": item["label"],
+                "status": "suspected",
+                "probability": item["prob"],
+                "laterality": "unspecified",
+                "location": "unspecified",
+                "severity": "moderate",
+                "clinician_note": "",
+            }
+            for item in result.get("findings", [])
+        ]
+        edited_structured = st.data_editor(
+            structured_rows,
+            num_rows="dynamic",
+            use_container_width=True,
+            key=f"structured_editor_{case_id}",
+        )
+        change_summary = st.text_input(
+            "Change summary",
+            value="Clinician reviewed and edited AI draft.",
+            key=f"change_summary_{case_id}",
+        )
+        if st.button("Save Report Version", use_container_width=True):
+            case_store.add_report_version(
+                case_id=case_id,
+                author_id_hash="demo-clinician",
+                source="clinician_edit",
+                report_text=edited_report,
+                structured_findings=edited_structured,
+                change_summary=change_summary,
+            )
+            st.toast("Report version saved")
+
+        versions = case_store.list_report_versions(case_id)
+        version_html = ""
+        for version in versions[:5]:
+            version_html += f"""
+            <div class='version-row'>
+              <div class='version-title'>{version['source']} · {version['change_summary'] or 'No summary'}</div>
+              <div class='version-meta'>{version['version_id']} · {version['created_at']}</div>
+            </div>
+            """
+        st.markdown(version_html or "<div class='run-hint'>No versions saved yet.</div>", unsafe_allow_html=True)
+
+    with st.expander("FHIR / PACS integration scaffold", expanded=False):
+        integration_source = st.radio("Source", ["FHIR", "PACS"], horizontal=True)
+        accession = st.text_input("Accession number", value=case.integration.get("accession_number") or "")
+        if integration_source == "FHIR":
+            patient_id = st.text_input("FHIR patient id", value="demo-patient-001")
+            encounter_id = st.text_input("FHIR encounter id", value="enc-demo-001")
+            imaging_study_id = st.text_input("FHIR ImagingStudy id", value="img-demo-001")
+            if st.button("Attach FHIR Metadata", use_container_width=True):
+                metadata = FHIRImport(
+                    patient_id=patient_id,
+                    encounter_id=encounter_id,
+                    imaging_study_id=imaging_study_id,
+                    accession_number=accession or None,
+                ).to_integration_metadata()
+                case_store.update_integration(case_id, integration=metadata)
+                st.toast("FHIR metadata attached")
+        else:
+            study_uid = st.text_input("DICOM StudyInstanceUID", value="1.2.840.demo.study")
+            series_uid = st.text_input("DICOM SeriesInstanceUID", value="1.2.840.demo.series")
+            aetitle = st.text_input("PACS AE title", value="CLINICALAI")
+            if st.button("Attach PACS Metadata", use_container_width=True):
+                metadata = PACSImport(
+                    study_instance_uid=study_uid,
+                    series_instance_uid=series_uid,
+                    accession_number=accession or None,
+                    aetitle=aetitle,
+                ).to_integration_metadata()
+                case_store.update_integration(case_id, integration=metadata)
+                st.toast("PACS metadata attached")
+
+        export_case = case_store.get_case(case_id)
+        fhir_export = build_diagnostic_report_resource(
+            case_id=export_case.case_id,
+            report_text=export_case.clinical_report,
+            structured_findings=export_case.structured_findings,
+            integration=export_case.integration,
+        )
+        st.json(fhir_export)
+
+    recent_cases = case_store.list_cases(limit=6)
+    items = []
+    for case in recent_cases:
+        chip_class = "urg-c" if case.urgency_score >= .75 else ("urg-m" if case.urgency_score >= .45 else "urg-l")
+        items.append(f"""
+        <div class='worklist-item'>
+          <div class='worklist-top'>
+            <span class='worklist-finding'>{case.top_finding}</span>
+            <span class='urg {chip_class}'>{case.status}</span>
+          </div>
+          <div class='worklist-meta'>
+            {case.case_id} · {case.priority} · urgency {case.urgency_score:.2f} · feedback {len(case.feedback)}
+          </div>
+        </div>
+        """)
+    st.markdown("".join(items), unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_analytics_dashboard(case_store):
+    with st.expander("Operational analytics and AI governance", expanded=False):
+        dashboard = CaseAnalytics(case_store).dashboard(limit=500)
+        summary = dashboard["summary"]
+        st.markdown("<div class='analytics-grid'>", unsafe_allow_html=True)
+        metrics = [
+            ("Cases", summary["total_cases"]),
+            ("Review Rate", f"{summary['review_rate']*100:.0f}%"),
+            ("Correction Rate", f"{summary['correction_rate']*100:.0f}%"),
+            ("Integration", f"{summary['integration_coverage']*100:.0f}%"),
+        ]
+        cols = st.columns(4)
+        for col, (label, value) in zip(cols, metrics):
+            with col:
+                st.markdown(
+                    f"<div class='analytics-card'><div class='analytics-value'>{value}</div><div class='analytics-label'>{label}</div></div>",
+                    unsafe_allow_html=True,
+                )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        if dashboard["alerts"]:
+            st.markdown("".join(f"<div class='alert-row'>{alert}</div>" for alert in dashboard["alerts"]), unsafe_allow_html=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Case Status**")
+            st.json(dashboard["status_counts"])
+            st.markdown("**Safety Flags**")
+            st.json(dashboard["safety_flags"])
+        with c2:
+            st.markdown("**Top Findings**")
+            st.json(dashboard["top_findings"])
+            st.markdown("**Integration Sources**")
+            st.json(dashboard["integration_sources"])
+
+        if dashboard["by_finding"]:
+            import pandas as pd
+
+            rows = [
+                {"finding": finding, **values}
+                for finding, values in dashboard["by_finding"].items()
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _render_validation_science_dashboard(case_store):
+    with st.expander("Clinical validation science and model development", expanded=False):
+        queue = build_active_learning_queue(case_store, limit=20)
+        specs = [spec.__dict__ for spec in default_dataset_specs()]
+        foundation = FoundationModelV2Spec().to_dict()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown(
+                f"<div class='analytics-card'><div class='analytics-value'>{len(specs)}</div><div class='analytics-label'>Registered Datasets</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c2:
+            st.markdown(
+                f"<div class='analytics-card'><div class='analytics-value'>{len(queue)}</div><div class='analytics-label'>Labeling Queue</div></div>",
+                unsafe_allow_html=True,
+            )
+        with c3:
+            st.markdown(
+                "<div class='analytics-card'><div class='analytics-value'>V2</div><div class='analytics-label'>Foundation Model Plan</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("**Dataset Registry**")
+        st.dataframe(specs, use_container_width=True, hide_index=True)
+
+        st.markdown("**Active Learning Queue**")
+        if queue:
+            import pandas as pd
+
+            st.dataframe(pd.DataFrame(queue), use_container_width=True, hide_index=True)
+        else:
+            st.markdown("<div class='run-hint'>No relabeling candidates yet. Corrected, uncertain, or escalated cases will appear here.</div>", unsafe_allow_html=True)
+
+        st.markdown("**Advanced Multimodal Model V2 Blueprint**")
+        st.json(foundation)
 
 
 if __name__ == "__main__":

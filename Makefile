@@ -20,7 +20,8 @@ install: ## Install all dependencies
 	$(PIP) install -r requirements.txt
 
 install-dev: ## Install dev dependencies
-	$(PIP) install black ruff pytest pytest-asyncio
+	$(PIP) install -r requirements-dev.txt
+	$(PIP) install black ruff
 
 run: ## Run the Streamlit demo app
 	streamlit run $(APP) --server.port $(PORT)

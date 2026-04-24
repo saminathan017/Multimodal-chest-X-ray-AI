@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -51,7 +51,7 @@ class AuditLogger:
         self.log_group      = log_group
         self.LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         self._cw_client     = None
-        self._log_stream    = f"clinical-ai-{datetime.utcnow().strftime('%Y-%m-%d')}"
+        self._log_stream    = f"clinical-ai-{datetime.now(UTC).strftime('%Y-%m-%d')}"
 
         if use_cloudwatch:
             self._init_cloudwatch(log_group)
@@ -93,7 +93,7 @@ class AuditLogger:
         entry = {
             "event_type":       "PREDICTION",
             "event_id":         str(uuid.uuid4()),
-            "timestamp_utc":    datetime.utcnow().isoformat() + "Z",
+            "timestamp_utc":    datetime.now(UTC).isoformat(),
             "request_id":       request_id,
             "user_id_hash":     user_id[:16] + "...",  # Truncated pseudonym
             "role":             role,
@@ -120,7 +120,7 @@ class AuditLogger:
         entry = {
             "event_type":   "RADIOLOGIST_FEEDBACK",
             "event_id":     str(uuid.uuid4()),
-            "timestamp_utc":datetime.utcnow().isoformat() + "Z",
+            "timestamp_utc":datetime.now(UTC).isoformat(),
             "request_id":   request_id,
             "user_id_hash": user_id[:16] + "...",
             "corrected":    corrected,
@@ -132,7 +132,7 @@ class AuditLogger:
         entry = {
             "event_type":   "ACCESS",
             "event_id":     str(uuid.uuid4()),
-            "timestamp_utc":datetime.utcnow().isoformat() + "Z",
+            "timestamp_utc":datetime.now(UTC).isoformat(),
             "user_id_hash": user_id[:16] + "...",
             "endpoint":     endpoint,
             "ip_hash":      ip_hash,
