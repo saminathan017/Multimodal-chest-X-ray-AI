@@ -25,7 +25,7 @@ import torch.nn as nn
 from loguru import logger
 from PIL import Image
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
 from src.models.cxr_image_model import CXRImageClassifier, set_backbone_trainable
@@ -49,6 +49,53 @@ CHEXPERT_LABELS = [
 ]
 
 U_ONES = {"Atelectasis", "Edema"}
+CRITICAL_LABELS = {"Cardiomegaly", "Edema", "Consolidation", "Pneumonia", "Pneumothorax", "Pleural Effusion"}
+
+
+class AsymmetricLoss(nn.Module):
+    """
+    Multilabel loss commonly used for long-tailed medical labels.
+
+    It down-weights easy negatives more aggressively than positives, which helps
+    rare findings without making every negative example dominate the gradient.
+    """
+
+    def __init__(
+        self,
+        gamma_neg: float = 4.0,
+        gamma_pos: float = 1.0,
+        clip: float = 0.05,
+        eps: float = 1e-8,
+        pos_weight: torch.Tensor | None = None,
+    ) -> None:
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+        self.register_buffer("pos_weight", pos_weight if pos_weight is not None else None)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = torch.sigmoid(logits)
+        probs_pos = probs
+        probs_neg = 1.0 - probs
+        if self.clip and self.clip > 0:
+            probs_neg = (probs_neg + self.clip).clamp(max=1.0)
+
+        loss_pos = targets * torch.log(probs_pos.clamp(min=self.eps))
+        loss_neg = (1.0 - targets) * torch.log(probs_neg.clamp(min=self.eps))
+
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            pt = probs_pos * targets + probs_neg * (1.0 - targets)
+            gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+            focal_weight = torch.pow(1.0 - pt, gamma)
+            loss_pos = loss_pos * focal_weight
+            loss_neg = loss_neg * focal_weight
+
+        loss = loss_pos + loss_neg
+        if self.pos_weight is not None:
+            loss = loss * (1.0 + targets * (self.pos_weight - 1.0))
+        return -loss.mean()
 
 
 def resolve_csvs(data_dir: Path) -> tuple[Path, Path]:
@@ -103,6 +150,7 @@ class CheXpertImageDataset(Dataset):
         split: str,
         uncertainty_policy: str,
         frontal_only: bool = True,
+        fail_on_missing: bool = False,
     ) -> None:
         df = clean_labels(pd.read_csv(csv_path), uncertainty_policy)
         if frontal_only and "Frontal/Lateral" in df.columns:
@@ -112,6 +160,7 @@ class CheXpertImageDataset(Dataset):
         self.split = split
         self.labels = CHEXPERT_LABELS
         self.image_size = image_size
+        self.fail_on_missing = fail_on_missing
 
         if split == "train":
             self.transform = transforms.Compose(
@@ -169,6 +218,8 @@ class CheXpertImageDataset(Dataset):
             image = Image.open(path).convert("RGB")
             image_tensor = self.transform(image)
         except Exception as exc:
+            if self.fail_on_missing:
+                raise FileNotFoundError(f"Could not read image {path}: {exc}") from exc
             logger.warning(f"Could not read image {path}: {exc}")
             image_tensor = torch.zeros(3, self.image_size, self.image_size)
 
@@ -185,6 +236,18 @@ def positive_weights(dataset: CheXpertImageDataset, clip: float = 12.0) -> torch
     return torch.tensor(weights, dtype=torch.float32)
 
 
+def sample_weights(dataset: CheXpertImageDataset, cap: float = 8.0) -> torch.Tensor:
+    """Give rare-positive rows a higher chance without oversampling too wildly."""
+    labels = dataset.df[CHEXPERT_LABELS].to_numpy(dtype=np.float32)
+    positives = labels.sum(axis=0)
+    frequencies = positives / max(labels.shape[0], 1)
+    inverse = 1.0 / np.maximum(frequencies, 1e-4)
+    inverse = inverse / inverse.mean()
+    row_weights = 1.0 + (labels * inverse).sum(axis=1)
+    row_weights = np.clip(row_weights, 1.0, cap)
+    return torch.tensor(row_weights, dtype=torch.double)
+
+
 def mean_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, dict[str, float]]:
     per_class: dict[str, float] = {}
     for idx, label in enumerate(CHEXPERT_LABELS):
@@ -196,11 +259,23 @@ def mean_auroc(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, dict[str,
     return (float(np.mean(list(per_class.values()))) if per_class else 0.0, per_class)
 
 
-def make_loader(dataset: Dataset, batch_size: int, workers: int, shuffle: bool) -> DataLoader:
+def critical_auroc(per_class: dict[str, float]) -> float:
+    values = [value for label, value in per_class.items() if label in CRITICAL_LABELS]
+    return float(np.mean(values)) if values else 0.0
+
+
+def make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    workers: int,
+    shuffle: bool,
+    sampler: WeightedRandomSampler | None = None,
+) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=workers,
         pin_memory=torch.cuda.is_available(),
         persistent_workers=workers > 0,
@@ -220,6 +295,7 @@ def train(args: argparse.Namespace) -> None:
         split="train",
         uncertainty_policy=args.uncertainty_policy,
         frontal_only=not args.include_lateral,
+        fail_on_missing=args.fail_on_missing,
     )
     valid_ds = CheXpertImageDataset(
         valid_csv,
@@ -228,9 +304,15 @@ def train(args: argparse.Namespace) -> None:
         split="valid",
         uncertainty_policy=args.uncertainty_policy,
         frontal_only=not args.include_lateral,
+        fail_on_missing=args.fail_on_missing,
     )
 
-    train_loader = make_loader(train_ds, args.batch_size, args.num_workers, shuffle=True)
+    sampler = None
+    if args.weighted_sampler:
+        sampler = WeightedRandomSampler(sample_weights(train_ds), num_samples=len(train_ds), replacement=True)
+        logger.info("Using weighted row sampler for rare-positive enrichment.")
+
+    train_loader = make_loader(train_ds, args.batch_size, args.num_workers, shuffle=True, sampler=sampler)
     valid_loader = make_loader(valid_ds, args.batch_size * 2, args.num_workers, shuffle=False)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -243,7 +325,17 @@ def train(args: argparse.Namespace) -> None:
     set_backbone_trainable(model, trainable=args.unfreeze_from_epoch <= 1)
 
     pos_weight = positive_weights(train_ds, clip=args.pos_weight_clip).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if args.loss == "bce":
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    elif args.loss == "asymmetric":
+        criterion = AsymmetricLoss(
+            gamma_neg=args.asl_gamma_neg,
+            gamma_pos=args.asl_gamma_pos,
+            clip=args.asl_clip,
+            pos_weight=pos_weight,
+        )
+    else:
+        raise ValueError(f"Unsupported loss: {args.loss}")
 
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -262,6 +354,9 @@ def train(args: argparse.Namespace) -> None:
         "train_rows": len(train_ds),
         "valid_rows": len(valid_ds),
         "pos_weight": [float(x) for x in pos_weight.detach().cpu().tolist()],
+        "loss": args.loss,
+        "weighted_sampler": args.weighted_sampler,
+        "tta": args.tta,
     }
     (output_dir / "training_config.json").write_text(json.dumps(metadata, indent=2))
 
@@ -296,11 +391,21 @@ def train(args: argparse.Namespace) -> None:
                 break
 
         scheduler.step()
-        val_auc, per_class = evaluate(model, valid_loader, device, args.amp)
+        val_auc, per_class = evaluate(model, valid_loader, device, args.amp, args.tta)
+        critical_auc = critical_auroc(per_class)
         train_loss = float(np.mean(losses)) if losses else 0.0
-        logger.info(f"Epoch {epoch}/{args.epochs} | Train Loss: {train_loss:.4f} | Val AUC: {val_auc:.4f}")
+        logger.info(
+            f"Epoch {epoch}/{args.epochs} | Train Loss: {train_loss:.4f} | "
+            f"Val AUC: {val_auc:.4f} | Critical AUC: {critical_auc:.4f}"
+        )
 
-        epoch_metrics = {"epoch": epoch, "train_loss": train_loss, "val_auc": val_auc, "per_class_auc": per_class}
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_auc": val_auc,
+            "critical_auc": critical_auc,
+            "per_class_auc": per_class,
+        }
         (output_dir / f"metrics_epoch_{epoch:03d}.json").write_text(json.dumps(epoch_metrics, indent=2))
 
         if val_auc > best_auc:
@@ -310,6 +415,7 @@ def train(args: argparse.Namespace) -> None:
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "val_auc": val_auc,
+                    "critical_auc": critical_auc,
                     "per_class_auc": per_class,
                     "config": metadata,
                 },
@@ -321,7 +427,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: str, amp: bool) -> tuple[float, dict[str, float]]:
+def evaluate(model: nn.Module, loader: DataLoader, device: str, amp: bool, tta: bool = False) -> tuple[float, dict[str, float]]:
     model.eval()
     probs: list[np.ndarray] = []
     labels: list[np.ndarray] = []
@@ -329,6 +435,9 @@ def evaluate(model: nn.Module, loader: DataLoader, device: str, amp: bool) -> tu
         images = batch["image"].to(device, non_blocking=True)
         with torch.cuda.amp.autocast(enabled=amp and device == "cuda"):
             logits = model(images)
+            if tta:
+                flipped_logits = model(torch.flip(images, dims=[3]))
+                logits = (logits + flipped_logits) / 2.0
         probs.append(torch.sigmoid(logits).float().cpu().numpy())
         labels.append(batch["labels"].numpy())
     return mean_auroc(np.concatenate(labels), np.concatenate(probs))
@@ -345,14 +454,21 @@ def main(argv: Iterable[str] | None = None) -> None:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.25)
+    parser.add_argument("--loss", default="asymmetric", choices=["bce", "asymmetric"])
+    parser.add_argument("--asl_gamma_neg", type=float, default=4.0)
+    parser.add_argument("--asl_gamma_pos", type=float, default=1.0)
+    parser.add_argument("--asl_clip", type=float, default=0.05)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--steps_per_epoch", type=int, default=0, help="0 means full epoch.")
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--uncertainty_policy", default="uones", choices=["zeros", "ones", "uones"])
     parser.add_argument("--pos_weight_clip", type=float, default=12.0)
+    parser.add_argument("--weighted_sampler", action="store_true")
     parser.add_argument("--unfreeze_from_epoch", type=int, default=2)
     parser.add_argument("--unfreeze_lr_scale", type=float, default=0.25)
     parser.add_argument("--include_lateral", action="store_true")
+    parser.add_argument("--fail_on_missing", action="store_true")
+    parser.add_argument("--tta", action="store_true")
     parser.add_argument("--no_pretrained", action="store_true")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
